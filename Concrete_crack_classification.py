@@ -16,6 +16,8 @@ from keras.applications.resnet import preprocess_input
 
 # Get the environment variable for the dataset path
 dataset_path = os.getenv("RESNET50_PATH")
+if dataset_path is None:
+    dataset_path = os.path.join(os.getcwd(), "resources/data")
 
 # Created Functions
 async def download_data():
@@ -111,7 +113,7 @@ def prepare_data():
                     for file in validation_files:
                         file_path = os.path.join(dir1, class_name, file)
                         try:
-                             shutil.move(file_path, os.path.join(dir2, class_name, os.path.basename(file)))
+                            shutil.move(file_path, os.path.join(dir2, class_name, os.path.basename(file)))
                         except FileExistsError:
                             print(f"File already exists: {os.path.join(dir2, class_name, os.path.basename(file))}")
                     
@@ -249,21 +251,83 @@ def predict_image(model, image_path):
     return prediction
 
 # Plot 
-def plot_prediction(image_path, prediction):
-    img = Image.open(image_path).resize((224, 224))
-    plt.imshow(img)
-    plt.axis('off')
-    plt.title(f"Predicted class: {(prediction)}")
+def plot_predictions(image_paths, predictions):
+    """
+    Plots multiple images with their predictions.
+
+    Args:
+        image_paths (list): List of image file paths.
+        predictions (list): List of predictions corresponding to the images.
+    """
+    # Ensure inputs are lists for consistent processing
+    if isinstance(image_paths, str):
+        image_paths = [image_paths]
+    if isinstance(predictions, str):
+        predictions = [predictions]
+    
+    if len(image_paths) != len(predictions):
+        raise ValueError("The number of images and predictions must match.")
+    if len(image_paths) == 1 and len(predictions) == 1:
+        cols = 1
+    else:
+        cols = 3  # Number of columns in the grid
+    num_images = len(image_paths)
+
+    rows = (num_images + cols - 1) // cols  # Calculate rows dynamically
+
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 5 * rows))
+    if num_images == 1:
+        axes =[axes]  # If only one image, keep axes as a single element array
+    else:
+        axes = axes.flatten()  # Flatten the axes array for easy iteration
+    for i, (image_path, prediction) in enumerate(zip(image_paths, predictions)):
+        img = Image.open(image_path).resize((224, 224))
+        axes[i].imshow(img)
+        axes[i].axis('off')
+        axes[i].set_title(f"Predicted: {prediction}")
+
+    # Hide any unused subplots
+    for j in range(i + 1, len(axes)):
+        axes[j].axis('off')
+
+    plt.tight_layout()
     plt.show()
+    plt.savefig(os.path.join("predictions", "predictions.png"))
+    plt.close()
+def plot_confusion_matrix(cm, classes, title='Confusion Matrix', cmap=plt.cm.Blues):
+            plt.figure(figsize=(10, 8))  # Adjust the width and height as needed
+            plt.imshow(cm, interpolation='nearest', cmap=cmap)
+            plt.title(title)
+            plt.colorbar()
+            tick_marks = np.arange(len(classes))
+            plt.xticks(tick_marks, classes.keys(), rotation=45)
+            plt.yticks(tick_marks, classes.keys())
+            plt.ylabel('True label')
+            plt.xlabel('Predicted label')
+            plt.show()
+            plt.savefig(os.path.join("predictions", "confusion_matrix.png"))
+            plt.close()
+def select_5_images_for_prediction(predicted_classes, actual_classes, test_generator):
+            # Get the file paths for the first 5 images
+            image_paths = []
+            predicted_labels = []
+            actual_labels = []
+            import random  # Add this import at the top of your file
+            # Select 5 random indices from the test filenames
+            random_indices = random.sample(range(len(test_generator.filenames)), 5)
+            for i in random_indices:
+                image_path = os.path.join("resources/data/test", test_generator.filenames[i])
+                if not os.path.exists(image_path):
+                    print(f"File not found: {image_path}")
+                    continue
+                image_paths.append(image_path)
+                predicted_labels.append("Negative" if predicted_classes[i] == 0 else "Positive")
+                actual_labels.append("Negative" if actual_classes[i] == 0 else "Positive")
+                print(f"Actual class: {actual_labels[-1]}, Predicted class: {predicted_labels[-1]}")
 
+            # Plot the predictions for the first 5 images
+            plot_predictions(image_paths, predicted_labels)
 
-def generate_unique_filename(base_name, extension):
-            counter = 1
-            while True:
-                model_name = f"{base_name}_{counter}.{extension}"
-                if not os.path.exists(model_name):
-                    return model_name
-                counter += 1
 # Load the project
 def load_project(Training, Loading, Evaluation, Prediction, remove_data=False):
     # Load dataset and create directory if resources/data does not exist
@@ -314,63 +378,28 @@ def load_project(Training, Loading, Evaluation, Prediction, remove_data=False):
         print("Test loss:", score[0])
         print("Test accuracy:", score[1])
     if Prediction:
-        # Prediction
-        image_path = "resources/data/test/Positive/Positive_18001_1.jpg"
-        prediction = predict_image(model, image_path)
-        if np.argmax(prediction) == 0:
-             prediction = "Negative"
-        else:
-             prediction = "Positive"
-        print("Predicted class:", prediction)
-        # Plot the prediction
-        plot_prediction(image_path, prediction)
+        print("Predicting on new images...")
         # Adjust steps_per_epoch for the test generator to 2500
-        step = 2500 # Max is 10 000
+        step = 8000 # Max is 8000
         steps_per_epoch = step // test_generator.batch_size
         predictions = model.predict(test_generator, steps=steps_per_epoch, verbose=2)
         # Get the predicted classes
         predicted_classes = np.argmax(predictions, axis=1)
         # Get the actual classes
         actual_classes = test_generator.classes[:step]
-        # Plot the first 5 predicted and actual classes
-        for i in range(5):
-            # Get the file path from the test generator
-            image_path = os.path.join(
-                "resources/data/test",
-                test_generator.filenames[i]
-            )
-            # Ensure the file exists
-            if not os.path.exists(image_path):
-                print(f"File not found: {image_path}")
-                continue
-            # Get the predicted and actual class labels
-            prediction = "Negative" if predicted_classes[i] == 0 else "Positive"
-            actual = "Negative" if actual_classes[i] == 0 else "Positive"
-            # Print the result
-            print(f"Actual class: {actual}, Predicted class: {prediction}")
-            # Plot the prediction
-            plot_prediction(image_path, prediction)
-        
+        # Select and plot 5 random images
+        print("Selecting 5 images for prediction...")
+        select_5_images_for_prediction(predicted_classes, actual_classes, test_generator)
         # Get the confusion matrix
         from sklearn.metrics import confusion_matrix
+        print("Calculating confusion matrix...")
         confusion_matrix = confusion_matrix(actual_classes, predicted_classes)
-        print("Confusion Matrix:")
-        print(confusion_matrix)
         # Plot the confusion matrix
-        def plot_confusion_matrix(cm, classes, title='Confusion Matrix', cmap=plt.cm.Blues):
-            plt.imshow(cm, interpolation='nearest', cmap=cmap)
-            plt.title(title)
-            plt.colorbar()
-            tick_marks = np.arange(len(classes))
-            plt.xticks(tick_marks, classes.keys(), rotation=45)
-            plt.yticks(tick_marks, classes.keys())
-            plt.ylabel('True label')
-            plt.xlabel('Predicted label')
-            plt.show()
         plot_confusion_matrix(confusion_matrix, classes=test_generator.class_indices, title="Confusion Matrix")
         # Save the confusion matrix
         from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
         # Calculate metrics
+        print("\nCalculating metrics...")
         accuracy = accuracy_score(actual_classes, predicted_classes)
         precision = precision_score(actual_classes, predicted_classes, zero_division=0.0)
         recall = recall_score(actual_classes, predicted_classes, zero_division=0.0)
@@ -396,8 +425,8 @@ if __name__ == "__main__":
     else:
         print("Model does not exist. Creating a new model for training..")
         try:
-             load_project(Training=True, Loading=False, Evaluation=True, Prediction=True)
+            load_project(Training=True, Loading=False, Evaluation=True, Prediction=True)
         except OSError:
-             shutil.rmtree("resources/data")
+            shutil.rmtree("resources/data")
 
 
