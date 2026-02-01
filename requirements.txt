@@ -1,0 +1,16 @@
+# Core libraries used by Concrete_crack_classification.py
+Pillow
+matplotlib
+numpy
+scikit-learn
+fastapi
+# Keras + TF backend
+h5py
+keras
+# TensorFlow CPU by default (GPU optional via WSL2 or DirectML)
+tensorflow
+# IBM Skills Network helper
+skillsnetwork
+# FastAPI server
+uvicorn
+python-multipart

@@ -1,18 +1,249 @@
 from PIL import Image
-from matplotlib.pyplot import imshow
-import pandas
 import matplotlib.pylab as plt
 import os
+# Set TensorFlow environment variables before importing TensorFlow
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"        # Disable oneDNN custom ops
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"        # Suppress INFO logs
+os.environ["TF_DETERMINISTIC_OPS"] = "1"        # Prefer deterministic behavior
 import asyncio
 import shutil
 import skillsnetwork
 import numpy as np
-import keras
-from keras.preprocessing.image import ImageDataGenerator
-from keras.models import Sequential
-from keras.layers import Dense
-from keras.applications import ResNet50
-from keras.applications.resnet import preprocess_input
+import tensorflow as tf
+# Prefer TensorFlow Keras imports for consistency
+from tensorflow.keras.utils import image_dataset_from_directory
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet import preprocess_input
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+
+from starlette.responses import FileResponse, JSONResponse, HTMLResponse
+import io
+
+# Globals for API serving
+CLASS_NAMES = ["Negative", "Positive"]
+MODEL = None
+
+def _ensure_dirs():
+    if not os.path.exists("predictions"):
+        os.makedirs("predictions")
+    if not os.path.exists("resources"):
+        os.makedirs("resources")
+    if not os.path.exists(os.path.join("resources", "data")):
+        os.makedirs(os.path.join("resources", "data"))
+
+_ensure_dirs()
+
+def _load_or_init_model():
+    global MODEL
+    model_name_trained = 'classifier_resnet_model_TRAINED.keras'
+    model_name = 'classifier_resnet_model.keras'
+    try:
+        if os.path.exists(model_name_trained):
+            try:
+                MODEL = tf.keras.models.load_model(model_name_trained, compile=False)
+            except Exception as e:
+                print(f"Failed to load trained model; falling back: {e}")
+                # Try weights-only fallback
+                try:
+                    MODEL = create_model(len(CLASS_NAMES))
+                    MODEL.load_weights(model_name_trained)
+                    print("Loaded trained weights into freshly built model.")
+                except Exception as e2:
+                    print(f"Failed to load trained weights: {e2}")
+                    MODEL = None
+        if MODEL is None and os.path.exists(model_name):
+            try:
+                MODEL = tf.keras.models.load_model(model_name, compile=False)
+            except Exception as e:
+                print(f"Failed to load base model; will recreate: {e}")
+                # Try weights-only fallback for base model
+                try:
+                    MODEL = create_model(len(CLASS_NAMES))
+                    MODEL.load_weights(model_name)
+                    print("Loaded base weights into freshly built model.")
+                except Exception as e2:
+                    print(f"Failed to load base weights: {e2}")
+                    MODEL = None
+        if MODEL is None:
+            MODEL = create_model(len(CLASS_NAMES))
+            try:
+                MODEL.save(model_name)
+            except Exception as e:
+                print(f"Warning: could not save base model: {e}")
+    except Exception as e:
+        print(f"Failed to load model: {e}")
+        MODEL = create_model(len(CLASS_NAMES))
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _load_or_init_model()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+async def read_root():
+        html = """
+        <!DOCTYPE html>
+        <html lang=\"en\">
+        <head>
+            <meta charset=\"UTF-8\" />
+            <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+            <title>Concrete Crack Classification API</title>
+            <style>
+                body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+                .container { max-width: 900px; margin: 40px auto; padding: 24px; }
+                h1 { margin: 0 0 8px; font-size: 28px; }
+                p { margin: 0 0 16px; color: #cbd5e1; }
+                .actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 20px 0; }
+                .btn { display: inline-block; padding: 10px 14px; border-radius: 8px; text-decoration: none; font-weight: 600; }
+                .primary { background: #3b82f6; color: white; }
+                .secondary { background: #334155; color: #e2e8f0; }
+                .card { background: #0b1220; border: 1px solid #1f2937; border-radius: 12px; padding: 16px; }
+                input[type=file] { display: block; margin: 10px 0 16px; }
+                button { padding: 10px 14px; border-radius: 8px; border: none; font-weight: 600; background: #22c55e; color: #052e1a; cursor: pointer; }
+                pre { background: #0b1220; padding: 12px; border-radius: 8px; overflow-x: auto; }
+                a { color: inherit; }
+            </style>
+        </head>
+        <body>
+            <div class=\"container\"> 
+                <h1>Concrete Crack Classification API</h1>
+                <p>Use the quick actions below or upload an image to get a prediction.</p>
+                <div class=\"actions\">
+                    <a class=\"btn primary\" href=\"/docs\">Open API Docs</a>
+                    <a class=\"btn secondary\" href=\"/health\">Health</a>
+                    <a class=\"btn secondary\" href=\"/confusion-matrix\">Confusion Matrix</a>
+                    <a class=\"btn secondary\" href=\"/predictions-image\">Predictions Image</a>
+                    <a class=\"btn secondary\" href=\"/train\">Start Training</a>
+                </div>
+                <div class=\"card\">
+                    <h2 style=\"margin-top:0\">Predict an Image</h2>
+                    <form id=\"predictForm\" action=\"/predict\" method=\"post\" enctype=\"multipart/form-data\">
+                        <input type=\"file\" name=\"file\" accept=\"image/*\" required />
+                        <button type=\"submit\">Predict</button>
+                    </form>
+                    <div id=\"result\" style=\"margin-top:12px\"></div>
+                </div>
+                <p style=\"margin-top:18px\">Tip: for detailed controls, open the <a href=\"/docs\">Swagger UI</a>.</p>
+            </div>
+            <script>
+                    const form = document.getElementById('predictForm');
+                    const fileInput = form.querySelector('input[name="file"]');
+                    form.addEventListener('submit', async (e) => {
+                        e.preventDefault();
+                        const fd = new FormData(form);
+                        const resEl = document.getElementById('result');
+                        resEl.innerHTML = 'Predicting...';
+                        try {
+                            const resp = await fetch('/predict', { method: 'POST', body: fd });
+                            const text = await resp.text();
+                            try {
+                                const json = JSON.parse(text);
+                                // Preview the uploaded image and show predicted label
+                                const file = fileInput.files && fileInput.files[0];
+                                let imgHtml = '';
+                                if (file) {
+                                    const url = URL.createObjectURL(file);
+                                    imgHtml = `<img src="${url}" alt="Uploaded Image" style="max-width:300px;border-radius:8px;display:block;" />`;
+                                    // Revoke after a short delay to allow rendering
+                                    setTimeout(() => URL.revokeObjectURL(url), 3000);
+                                }
+                                const label = (json.predicted_label ?? '').toString();
+                                const probs = json.probabilities ? `<pre>${JSON.stringify(json.probabilities, null, 2)}</pre>` : '';
+                                resEl.innerHTML = `
+                                    <div style="margin-top:12px">
+                                        ${imgHtml}
+                                        <div style="margin-top:8px;font-weight:700">Predicted: ${label}</div>
+                                        ${probs}
+                                    </div>
+                                `;
+                            } catch {
+                                // Fallback: non-JSON error or unexpected response
+                                resEl.innerHTML = '<pre>' + text.replace(/</g,'&lt;') + '</pre>';
+                            }
+                        } catch (err) {
+                            resEl.textContent = 'Error: ' + (err && err.message ? err.message : err);
+                        }
+                    });
+                </script>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html)
+
+
+def _predict_from_bytes(image_bytes: bytes):
+    if MODEL is None:
+        _load_or_init_model()
+    with Image.open(io.BytesIO(image_bytes)) as im:
+        img = im.resize((224, 224))
+        arr = np.array(img)
+        arr = np.expand_dims(arr, axis=0)
+        arr = preprocess_input(arr)
+        preds = MODEL.predict(arr)
+        probs = preds[0].tolist()
+        idx = int(np.argmax(preds, axis=1)[0])
+        return {
+            "predicted_index": idx,
+            "predicted_label": CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else str(idx),
+            "probabilities": {CLASS_NAMES[i] if i < len(CLASS_NAMES) else str(i): float(p) for i, p in enumerate(probs)}
+        }
+
+def _train_task():
+    try:
+        load_project(Training=True, Loading=False, Evaluation=True, Prediction=False)
+    finally:
+        _load_or_init_model()
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": MODEL is not None, "classes": CLASS_NAMES}
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+    data = await file.read()
+    try:
+        results = _predict_from_bytes(data)
+        html = """ \
+        "<!DOCTYPE html>" \
+        "<html><head><title>" \
+        "Prediction Result" \
+        "</title>" \
+        "</head>" \
+        "<img src={image} alt="Uploaded Image" style="max-width:300px;"/><br>" \
+        "<h2>Prediction: {prediction}</h2>" \
+        "<body>"
+        """
+        
+        return JSONResponse(results)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/train")
+def train(background_tasks: BackgroundTasks):
+    background_tasks.add_task(_train_task)
+    return {"status": "started"}
+
+@app.get("/confusion-matrix")
+def confusion_matrix_image():
+    path = os.path.join("predictions", "confusion_matrix.png")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="image/png")
+    raise HTTPException(status_code=404, detail="Confusion matrix not found")
+
+@app.get("/predictions-image")
+def predictions_image():
+    path = os.path.join("predictions", "predictions.png")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="image/png")
+    raise HTTPException(status_code=404, detail="Predictions image not found")
 
 # Get the environment variable for the dataset path
 dataset_path = os.getenv("RESNET50_PATH")
@@ -29,13 +260,13 @@ async def download_data():
             )
 def download():
         # Set a valid temporary directory for Windows
-        tmp_dir ="C:/tmp"
+        tmp_dir ="D:/tmp"
 
         if not os.path.exists(tmp_dir):
             os.makedirs(tmp_dir)
-        os.environ["TMPDIR"] = tmp_dir
-        os.environ["TMP"] = tmp_dir
-        os.environ["TEMP"] = tmp_dir
+        #os.environ["TMPDIR"] = tmp_dir
+        #os.environ["TMP"] = tmp_dir
+        #os.environ["TEMP"] = tmp_dir
 
         # Create directory if it doesn't exist
         if not os.path.exists(dataset_path):
@@ -55,7 +286,7 @@ def download():
         asyncio.run(download_data())
 def prepare_data():
         # Split class data
-        directory = "resources\\data"
+        directory = dataset_path
 
         negative_path = os.path.join(directory, "Negative")
         positive_path = os.path.join(directory, "Positive")
@@ -90,9 +321,9 @@ def prepare_data():
                 return path
 
             # Create train, test, and validation directories if they don't exist
-            train_dir = create_directory(dataset_path+"\\train")
-            test_dir = create_directory(dataset_path+"\\test")
-            validation_dir = create_directory(dataset_path+"\\validation")
+            train_dir = create_directory(os.path.join(dataset_path, "train"))
+            test_dir = create_directory(os.path.join(dataset_path, "test"))
+            validation_dir = create_directory(os.path.join(dataset_path, "validation"))
             print("Moving files to train, test, and validation directories...")
             # Function to move files
             def move_files(files, dir1, dir2, dir3, class_name):
@@ -148,9 +379,9 @@ def prepare_data():
             print("Number of images in validation Positive directory:", len(os.listdir(os.path.join(validation_dir, "Positive"))))
         else:
             # Get the dataset paths
-            train_dir = dataset_path+"\\train"
-            test_dir = dataset_path+"\\test"
-            validation_dir = dataset_path+"\\validation"
+            train_dir = os.path.join(dataset_path, "train")
+            test_dir = os.path.join(dataset_path, "test")
+            validation_dir = os.path.join(dataset_path, "validation")
             
         # Remove empty directories
         if os.path.exists(negative_path):
@@ -161,28 +392,34 @@ def prepare_data():
         return train_dir, test_dir, validation_dir
 # Define the data_gen parameters
 def data_generation(directory, shuffle_data=True):
-        data_generator = ImageDataGenerator(preprocessing_function=preprocess_input)
-        data_gen = data_generator.flow_from_directory(
+        # Create a tf.data.Dataset from a directory structure
+        ds = image_dataset_from_directory(
             directory,
+            labels='inferred',
+            label_mode='categorical',
             batch_size=4,
-            class_mode='categorical',
-            seed=24,
-            target_size=(224, 224),
+            image_size=(224, 224),
             shuffle=shuffle_data,
+            seed=24,
         )
-        return data_gen
+        # Apply ResNet50 preprocessing to batches
+        ds = ds.map(lambda x, y: (preprocess_input(tf.cast(x, tf.float32)), y))
+        ds = ds.prefetch(tf.data.AUTOTUNE)
+        return ds
 def plot_image_batch(generator):
-        # Plot images from the generator
-        first_batch_images = generator.next()[0]
-        fig, axs = plt.subplots(nrows=2, ncols=2, figsize=(20, 10))
-        ind = 0
-        for ax1 in axs:
-            for ax2 in ax1:
-                image_data = first_batch_images[ind].astype(np.uint8)
-                ax2.imshow(image_data)
-                ind += 1
-        fig.suptitle("First Batch of Images")
-        plt.show()
+    # Plot images from the dataset (first batch)
+    first_batch_images, _ = next(iter(generator))
+    # Clip to [0, 255] and cast for display
+    first_batch_images = tf.clip_by_value(first_batch_images, 0, 255).numpy().astype(np.uint8)
+    fig, axs = plt.subplots(nrows=2, ncols=2, figsize=(20, 10))
+    ind = 0
+    for ax1 in axs:
+        for ax2 in ax1:
+            image_data = first_batch_images[ind]
+            ax2.imshow(image_data)
+            ind += 1
+    fig.suptitle("First Batch of Images")
+    plt.show()
 # Define the model
 def create_model(num_classes):
     model = Sequential()
@@ -190,6 +427,7 @@ def create_model(num_classes):
     # Add ResNet50 model
     model.add(ResNet50(
         include_top=False,
+        input_shape=(224, 224, 3),
         pooling="avg",
         weights="imagenet",
     ))
@@ -206,9 +444,9 @@ def create_model(num_classes):
 # Fit the model
 def fit_model(model, epochs ,training_data, validation_data):
 
-        save_path = "classifier_resnet_model.h5"
+        save_path = "classifier_resnet_model.keras"
         # Check if the model already exists
-        Checkpoints = keras.callbacks.ModelCheckpoint(
+        Checkpoints = tf.keras.callbacks.ModelCheckpoint(
             save_path,
             monitor='val_accuracy',
             save_best_only=True,
@@ -216,13 +454,13 @@ def fit_model(model, epochs ,training_data, validation_data):
             verbose=1
         )
         Callback_list = [Checkpoints]
-        # Check if the model already exists
-        train_steps = 100 // training_data.batch_size # Max is 10 000
-        validation_steps = 100 // validation_data.batch_size # Max is 10 000
+        # Determine number of batches from dataset cardinality
+        train_steps = tf.data.experimental.cardinality(training_data).numpy()
+        validation_steps = tf.data.experimental.cardinality(validation_data).numpy()
 
         history = model.fit(
             training_data,
-            steps_per_epoch=validation_steps,
+            steps_per_epoch=train_steps,
             epochs=epochs,
             validation_data=validation_data,
             validation_steps=validation_steps, 
@@ -232,13 +470,27 @@ def fit_model(model, epochs ,training_data, validation_data):
 
 # Plot the training history
 def plot_history(history):
-    # Plot training & validation accuracy values
-    plt.plot(history.history['accuracy'])
-    plt.plot(history.history['val_accuracy'])
-    plt.title('Model accuracy')
+    # Extract accuracy metrics robustly
+    acc = history.history.get('accuracy') or history.history.get('categorical_accuracy') or []
+    val_acc = history.history.get('val_accuracy') or history.history.get('val_categorical_accuracy') or []
+    epochs = list(range(1, max(len(acc), len(val_acc)) + 1))
+
+    plt.figure(figsize=(8, 5))
+    if acc:
+        plt.plot(epochs, acc, marker='o', label='Train')
+    if val_acc:
+        plt.plot(epochs, val_acc, marker='s', label='Validation')
+    plt.title('Model Accuracy')
     plt.ylabel('Accuracy')
     plt.xlabel('Epoch')
-    plt.legend(['Train', 'Validation'], loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc='upper left')
+    # Save and show for visibility
+    try:
+        os.makedirs('predictions', exist_ok=True)
+        plt.savefig(os.path.join('predictions', 'training_history.png'))
+    except Exception:
+        pass
     plt.show()
 
 # Make predictions on new images
@@ -291,9 +543,10 @@ def plot_predictions(image_paths, predictions):
         axes[j].axis('off')
 
     plt.tight_layout()
-    plt.show()
     plt.savefig(os.path.join("predictions", "predictions.png"))
-    plt.close()
+    plt.show()
+    
+
 def plot_confusion_matrix(cm, classes, title='Confusion Matrix', cmap=plt.cm.Blues):
             plt.figure(figsize=(10, 8))  # Adjust the width and height as needed
             plt.imshow(cm, interpolation='nearest', cmap=cmap)
@@ -304,34 +557,46 @@ def plot_confusion_matrix(cm, classes, title='Confusion Matrix', cmap=plt.cm.Blu
             plt.yticks(tick_marks, classes.keys())
             plt.ylabel('True label')
             plt.xlabel('Predicted label')
-            plt.show()
             plt.savefig(os.path.join("predictions", "confusion_matrix.png"))
-            plt.close()
-def select_5_images_for_prediction(predicted_classes, actual_classes, test_generator):
-            # Get the file paths for the first 5 images
+            plt.show()
+            
+
+def select_5_images_for_prediction(predicted_classes, actual_classes, test_dir):
+            # Randomly select 5 images from test directory and predict
+            import random
             image_paths = []
             predicted_labels = []
             actual_labels = []
-            import random  # Add this import at the top of your file
-            # Select 5 random indices from the test filenames
-            random_indices = random.sample(range(len(test_generator.filenames)), 5)
-            for i in random_indices:
-                image_path = os.path.join("resources/data/test", test_generator.filenames[i])
-                if not os.path.exists(image_path):
-                    print(f"File not found: {image_path}")
-                    continue
+
+            candidates = []
+            for cls in ["Negative", "Positive"]:
+                cls_dir = os.path.join(test_dir, cls)
+                if os.path.isdir(cls_dir):
+                    for f in os.listdir(cls_dir):
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                            candidates.append(os.path.join(cls_dir, f))
+
+            if not candidates:
+                print("No test images found for prediction preview.")
+                return
+
+            for image_path in random.sample(candidates, k=min(5, len(candidates))):
                 image_paths.append(image_path)
-                predicted_labels.append("Negative" if predicted_classes[i] == 0 else "Positive")
-                actual_labels.append("Negative" if actual_classes[i] == 0 else "Positive")
+                # Actual label inferred from path
+                actual_labels.append(os.path.basename(os.path.dirname(image_path)))
+                # Predict using the model on each image
+                pred = predict_image(MODEL, image_path)
+                idx = int(np.argmax(pred, axis=1)[0])
+                predicted_labels.append("Negative" if idx == 0 else "Positive")
                 print(f"Actual class: {actual_labels[-1]}, Predicted class: {predicted_labels[-1]}")
 
-            # Plot the predictions for the first 5 images
             plot_predictions(image_paths, predicted_labels)
 
 # Load the project
-def load_project(Training, Loading, Evaluation, Prediction, remove_data=False):
-    # Load dataset and create directory if resources/data does not exist
-    if not os.path.exists('resources/data') or (os.path.exists('resources/data') and len(os.listdir('resources/data')) == 0):
+def load_project(Training,Loading, Evaluation, Prediction, remove_data=False, epoch:int = 1):
+    global MODEL
+    # Load dataset and create directory if dataset_path does not exist
+    if not os.path.exists(dataset_path) or (os.path.exists(dataset_path) and len(os.listdir(dataset_path)) == 0):
         print("Downloading the dataset...")
         download()
     # Prepare the dataset by splitting the Positive and Negative files into training, test and validation directories
@@ -341,61 +606,92 @@ def load_project(Training, Loading, Evaluation, Prediction, remove_data=False):
     test_generator = data_generation(test_dir, shuffle_data=False)
     validation_generator = data_generation(validation_dir)
     # Get classes
-    num_classes = len(train_generator.class_indices)
+    num_classes = len(getattr(train_generator, 'class_names', CLASS_NAMES))
+    model = None
     if Loading:
         # Load model -- Trained with priority
-        model_name = 'classifier_resnet_model.h5'
-        model_name_trained = 'classifier_resnet_model_TRAINED.h5'
+        model_name = 'classifier_resnet_model.keras'
+        model_name_trained = 'classifier_resnet_model_TRAINED.keras'
         if os.path.exists(model_name_trained):
             print("Loading the trained model...")
             try:
-                model = keras.models.load_model(model_name_trained)
+                model = tf.keras.models.load_model(model_name_trained, compile=False)
             except Exception as e:
                 print(f"Failed to load the trained model: {e}")
-        else:
-            if os.path.exists(model_name):
-                print("Loading the model...")
-                model = keras.models.load_model(model_name)
+                # Fallback: build architecture and load weights only
+                try:
+                    model = create_model(num_classes)
+                    model.load_weights(model_name_trained)
+                    print("Loaded trained weights into freshly built model.")
+                except Exception as e2:
+                    print(f"Failed to load trained weights: {e2}")
+                    model = None
+        if model is None and os.path.exists(model_name):
+            print("Loading the base model...")
+            try:
+                model = tf.keras.models.load_model(model_name, compile=False)
+            except Exception as e:
+                print(f"Failed to load the base model: {e}")
+                # Fallback: build architecture and load weights only
+                try:
+                    model = create_model(num_classes)
+                    model.load_weights(model_name)
+                    print("Loaded base weights into freshly built model.")
+                except Exception as e2:
+                    print(f"Failed to load base weights: {e2}")
+                    model = None
     else:
         # Create model
         model = create_model(num_classes)
         # Save the model before training
-        model.save('classifier_resnet_model.h5')
+        model.save('classifier_resnet_model.keras')
+
+    # If still no model (e.g., load failures), create a fresh one
+    if model is None:
+        print("Creating a fresh model due to load failures...")
+        model = create_model(num_classes)
+
+    # Keep global MODEL in sync for downstream functions that rely on it
+    MODEL = model
     # Fit the model
     if Training:
-        history = fit_model(model, 1 , train_generator, validation_generator)
-        model_name = "classifier_resnet_model_TRAINED.h5"
+        history = fit_model(model, epoch, train_generator, validation_generator)
+        model_name = "classifier_resnet_model_TRAINED.keras"
         print("Training completed.")
         # Save the model after training
         print("saving model...")
         model.save(model_name)
         # Plot the training history
         plot_history(history)
-    if Evaluation:
+    if Evaluation and model is not None:
         # Evaluate the model
         print("Evaluating the model...")
-        score = model.evaluate(test_generator, steps=len(test_generator))
+        val_steps = tf.data.experimental.cardinality(test_generator).numpy()
+        score = model.evaluate(test_generator, steps=val_steps)
         print("Test loss:", score[0])
         print("Test accuracy:", score[1])
-    if Prediction:
+    if Prediction and model is not None:
         print("Predicting on new images...")
-        # Adjust steps_per_epoch for the test generator to 2500
-        step = 8000 # Max is 8000
-        steps_per_epoch = step // test_generator.batch_size
-        predictions = model.predict(test_generator, steps=steps_per_epoch, verbose=2)
-        # Get the predicted classes
+        # Predict across entire test dataset
+        predictions = model.predict(test_generator, verbose=1)
         predicted_classes = np.argmax(predictions, axis=1)
-        # Get the actual classes
-        actual_classes = test_generator.classes[:step]
-        # Select and plot 5 random images
+        # Extract actual classes from dataset
+        actual_classes = []
+        for _, y in test_generator:
+            actual_classes.extend(np.argmax(y.numpy(), axis=1))
+        actual_classes = np.array(actual_classes)[:len(predicted_classes)]
+        # Select and plot 5 random images from test folder
         print("Selecting 5 images for prediction...")
-        select_5_images_for_prediction(predicted_classes, actual_classes, test_generator)
+        select_5_images_for_prediction(predicted_classes, actual_classes, test_dir)
         # Get the confusion matrix
         from sklearn.metrics import confusion_matrix
         print("Calculating confusion matrix...")
         confusion_matrix = confusion_matrix(actual_classes, predicted_classes)
+        # Build class index mapping from dataset class names
+        class_names = getattr(test_generator, 'class_names', CLASS_NAMES)
+        class_index = {name: i for i, name in enumerate(class_names)}
         # Plot the confusion matrix
-        plot_confusion_matrix(confusion_matrix, classes=test_generator.class_indices, title="Confusion Matrix")
+        plot_confusion_matrix(confusion_matrix, classes=class_index, title="Confusion Matrix")
         # Save the confusion matrix
         from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
         # Calculate metrics
@@ -412,9 +708,12 @@ def load_project(Training, Loading, Evaluation, Prediction, remove_data=False):
         print(f"F1-Score: {f1:.2f}")
         if remove_data:
             # Delete the downloaded dataset
-            shutil.rmtree("resources/data")
+            shutil.rmtree(dataset_path)
             # Delete the temporary directory
             shutil.rmtree("C:/tmp")
+
+    if (Evaluation or Prediction) and model is None:
+        print("Skipped evaluation/prediction because the model could not be loaded or created.")
 
 # Main function to run the project
 if __name__ == "__main__":
